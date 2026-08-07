@@ -30,12 +30,10 @@ competition:
 # Data Settings
 # ──────────────────────────────────────────────────────────────────────────────
 data:
-  image_size: [224, 224]       # (H, W) — input spatial resolution
-  num_slices: 32               # Number of consecutive 2‑D slices per volume
-  batch_size: 8
-  num_workers: 4
-  max_text_length: 256         # Tokeniser truncation length for radiology reports
-
+  image_size: [224, 224]
+  num_slices: 32
+  batch_size: 2  # Changed from 8 to 2 to prevent GPU OOM
+  num_workers: 2 # Reduced workers to prevent dataloader freeze
 # ──────────────────────────────────────────────────────────────────────────────
 #
 # Model & Optimisation Settings

@@ -236,7 +236,7 @@ def validate(
     target_columns: List[str],
     use_amp: bool,
 ) -> Tuple[float, float, Dict[str, float]]:
-    """Run validation and compute macro-AUC.
+    """Run validation and compute macro-AUC with memory leak protection.
 
     Returns
     -------
@@ -245,6 +245,11 @@ def validate(
     per_class_auc : Dict[str, float]
     """
     model.eval()
+
+    # Clear GPU VRAM before starting validation loop
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
     running_loss: float = 0.0
     num_batches: int = 0
     all_preds: List[np.ndarray] = []
@@ -264,9 +269,15 @@ def validate(
         running_loss += loss.item()
         num_batches += 1
 
-        probs: torch.Tensor = torch.sigmoid(logits).cpu().numpy()
+        probs: np.ndarray = torch.sigmoid(logits.detach()).cpu().numpy()
         all_preds.append(probs)
-        all_labels.append(labels.cpu().numpy())
+        all_labels.append(labels.detach().cpu().numpy())
+
+        # Immediate batch memory cleanup
+        del images, labels, logits, loss
+
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
     avg_loss: float = running_loss / max(num_batches, 1)
     y_pred: np.ndarray = np.concatenate(all_preds, axis=0)
@@ -365,7 +376,7 @@ def run_training(
     )
     val_loader = DataLoader(
         val_ds,
-        batch_size=batch_size * 2,
+        batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=(device.type == "cuda"),
