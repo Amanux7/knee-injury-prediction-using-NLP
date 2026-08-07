@@ -1,0 +1,49 @@
+# ==============================================================================
+# RSNA Knee Abnormality Detection — Baseline Configuration
+# ==============================================================================
+# This YAML file centralises every hyperparameter and path constant used across
+# training, inference, and submission scripts.  Modify values here rather than
+# scattering magic numbers throughout the codebase.
+# ==============================================================================
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Competition Metadata
+# ──────────────────────────────────────────────────────────────────────────────
+competition:
+  name: "rsna-knee-abnormality-detection"
+  num_classes: 12
+  target_columns:
+    - "ACL"
+    - "MCL"
+    - "Medial Meniscus"
+    - "Lateral Meniscus"
+    - "Medial OA"
+    - "Lateral OA"
+    - "PF OA"
+    - "Effusion"
+    - "Synovitis"
+    - "Baker's"
+    - "Contusion"
+    - "Fracture"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Data Settings
+# ──────────────────────────────────────────────────────────────────────────────
+data:
+  image_size: [224, 224]       # (H, W) — input spatial resolution
+  num_slices: 32               # Number of consecutive 2‑D slices per volume
+  batch_size: 8
+  num_workers: 4
+  max_text_length: 256         # Tokeniser truncation length for radiology reports
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Model & Optimisation Settings
+# ──────────────────────────────────────────────────────────────────────────────
+model:
+  backbone: "resnet34"
+
+training:
+  learning_rate: 3.0e-4
+  weight_decay: 1.0e-2
+  epochs: 10
+  seed: 42

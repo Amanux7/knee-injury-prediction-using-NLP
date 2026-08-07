@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Large model checkpoints and dataset artifacts
+checkpoints/
+*.pth
+*.pt
+*.bin
+*.onnx
+
+# Local CSV outputs / generated data
+submission.csv
+train_folds.csv
+train.csv
+test.csv
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
