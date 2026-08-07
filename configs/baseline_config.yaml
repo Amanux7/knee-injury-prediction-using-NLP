@@ -37,10 +37,11 @@ data:
   max_text_length: 256         # Tokeniser truncation length for radiology reports
 
 # ──────────────────────────────────────────────────────────────────────────────
+#
 # Model & Optimisation Settings
-# ──────────────────────────────────────────────────────────────────────────────
+#
 model:
-  backbone: "resnet34"
+  backbone: "dinov2_vitb14"
 
 training:
   learning_rate: 3.0e-4

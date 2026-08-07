@@ -11,6 +11,10 @@ checkpoints/
 *.pt
 *.bin
 *.onnx
+*.tar.gz
+*.tar
+*.zip
+models_cache/
 
 # Local CSV outputs / generated data
 submission.csv
@@ -22,3 +26,8 @@ test.csv
 .vscode/
 .idea/
 .DS_Store
+
+*.tar.gz
+*.pth
+checkpoints/
+data/
