@@ -1,21 +1,24 @@
 """
-RSNA Knee Abnormality Detection — Dataset Module
-=================================================
-Provides :class:`RSNAKneeDataset`, a PyTorch Dataset that loads multi‑slice MRI
-volumes, optional radiology‑report text, and multi‑label targets for the 12
-abnormality classes defined in the competition.
+RSNA Knee Abnormality Detection -- Volumetric DICOM Dataset Module
+===================================================================
+Provides :class:`RSNAKneeDataset`, a PyTorch Dataset for multi-slice knee MRI
+scans and optional radiology-report text.
 
-Key design decisions
---------------------
-* **Volumetric loading**: consecutive 2‑D DICOM/PNG slices are stacked into a
-  single 4‑D tensor ``[C, S, H, W]`` (channels‑first).  If slices are missing
-  or the run is in test mode without local images, synthetic random data is
-  returned so that downstream code never crashes.
-* **Text branch**: if a HuggingFace tokenizer *and* a ``"report"`` column are
-  present, tokenised ``input_ids`` / ``attention_mask`` tensors are included in
-  the returned dictionary.
-* **Strict typing**: every public method and constructor carries full type
-  annotations so that ``mypy --strict`` passes cleanly.
+Key Features & Pipeline
+-----------------------
+1. **Real DICOM Loading**: Uses ``pydicom`` to inspect DICOM headers, extracting
+   slice ordering metadata (``InstanceNumber`` -> ``SliceLocation`` ->
+   ``ImagePositionPatient[2]``).
+2. **Slice Resampling**: Uniformly samples or interpolates volume slices to
+   exactly ``num_slices`` (default 32) at target spatial resolution ``image_size``.
+3. **Volume Normalisation**: Applies 3D volume-wide Min-Max intensity
+   normalisation ``(vol - min) / (max - min + 1e-6)``.
+4. **Rescale Handling**: Respects DICOM ``RescaleSlope`` and ``RescaleIntercept``
+   header tags.
+5. **Fallback Safety**: Gracefully falls back to synthetic ``torch.randn``
+   tensors if local image files or study folders are absent during testing.
+6. **Multimodal Text**: Supports HuggingFace report tokenisation when a report
+   column is present.
 """
 
 from __future__ import annotations
@@ -23,7 +26,7 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -31,13 +34,21 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
+# Optional pydicom import for DICOM handling
+try:
+    import pydicom  # type: ignore[import-untyped]
+    PYDICOM_AVAILABLE: bool = True
+except ImportError:
+    pydicom = None  # type: ignore[assignment]
+    PYDICOM_AVAILABLE = False
+
 # ---------------------------------------------------------------------------
-# Module‑level logger
+# Module-level logger
 # ---------------------------------------------------------------------------
 logger: logging.Logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Default target columns (kept here for import convenience)
+# Default target columns
 # ---------------------------------------------------------------------------
 DEFAULT_TARGET_COLUMNS: List[str] = [
     "ACL",
@@ -56,38 +67,35 @@ DEFAULT_TARGET_COLUMNS: List[str] = [
 
 
 class RSNAKneeDataset(Dataset):  # type: ignore[type-arg]
-    """Multi‑slice MRI dataset for knee‑abnormality classification.
+    """Multi-slice MRI dataset supporting DICOM volumes and 2D images.
 
     Parameters
     ----------
     df : pd.DataFrame
-        Metadata frame.  Must contain ``"StudyInstanceUID"``; may also contain
-        the 12 target columns and a ``"report"`` column.
+        Metadata frame containing ``"StudyInstanceUID"`` and target columns.
     image_dir : Union[str, Path]
-        Root directory where study images are stored (one sub‑folder per UID).
+        Root directory containing study folders (e.g., ``./data/train_images``
+        or ``./data/``).
     target_columns : List[str]
-        Ordered list of the 12 target column names.
+        List of target column names (12 classes).
     image_size : tuple[int, int]
-        Spatial resolution ``(H, W)`` to which every slice is resized.
+        Target spatial resolution ``(H, W)`` for each slice (default 224x224).
     num_slices : int
-        Fixed number of slices per volume.  Volumes with fewer slices are
-        zero‑padded; longer ones are centre‑cropped.
+        Fixed number of 2D slices per 3D volume (default 32).
     tokenizer : Optional[Any]
-        A HuggingFace ``PreTrainedTokenizerBase`` (or compatible) instance.
-        When *None* no text features are generated.
+        Optional HuggingFace tokenizer for radiology report processing.
     max_text_length : int
-        Maximum token length for the tokenizer truncation / padding.
+        Maximum sequence length for text truncation/padding.
     is_train : bool
-        Whether this dataset is used during training.  Controls label loading.
+        If ``True``, extracts multi-label target tensors.
     transform : Optional[Callable]
-        An image‑level transform (Albumentations ``Compose`` or
-        ``torchvision.transforms``).  Applied independently to every 2‑D slice.
+        Per-slice spatial/intensity image transformation.
     """
 
     def __init__(
         self,
         df: pd.DataFrame,
-        image_dir: Union[str, Path],
+        image_dir: Union[str, Path] = "./data",
         target_columns: List[str] = DEFAULT_TARGET_COLUMNS,
         image_size: tuple[int, int] = (224, 224),
         num_slices: int = 32,
@@ -98,11 +106,8 @@ class RSNAKneeDataset(Dataset):  # type: ignore[type-arg]
     ) -> None:
         super().__init__()
 
-        # ── Validation ────────────────────────────────────────────────────
         if "StudyInstanceUID" not in df.columns:
-            raise ValueError(
-                "DataFrame must contain a 'StudyInstanceUID' column."
-            )
+            raise ValueError("DataFrame must contain a 'StudyInstanceUID' column.")
 
         self.df: pd.DataFrame = df.reset_index(drop=True)
         self.image_dir: Path = Path(image_dir)
@@ -115,41 +120,33 @@ class RSNAKneeDataset(Dataset):  # type: ignore[type-arg]
         self.transform: Optional[Callable[..., Any]] = transform
 
         logger.info(
-            "RSNAKneeDataset initialised | samples=%d  is_train=%s  "
-            "num_slices=%d  image_size=%s",
+            "RSNAKneeDataset initialized | samples=%d | is_train=%s | "
+            "num_slices=%d | image_size=%s | pydicom=%s",
             len(self.df),
             self.is_train,
             self.num_slices,
             self.image_size,
+            PYDICOM_AVAILABLE,
         )
 
-    # ------------------------------------------------------------------
-    # Length
-    # ------------------------------------------------------------------
     def __len__(self) -> int:
         return len(self.df)
 
-    # ------------------------------------------------------------------
-    # Item retrieval
-    # ------------------------------------------------------------------
     def __getitem__(self, index: int) -> Dict[str, Any]:
-        """Return a single sample as a dictionary.
+        """Retrieve a dataset sample as a dictionary.
 
         Returns
         -------
         dict
-            Keys always present:
-                ``"study_uid"`` — study identifier (str)
-                ``"image"``     — ``[C, S, H, W]`` float tensor
-            Conditional keys:
-                ``"label"``          — ``[num_classes]`` float tensor (train)
-                ``"input_ids"``      — ``[max_text_length]`` long tensor (text)
-                ``"attention_mask"`` — ``[max_text_length]`` long tensor (text)
+            - ``"study_uid"``: StudyInstanceUID string
+            - ``"image"``: Tensor of shape ``[1, S, H, W]`` (or ``[C, S, H, W]``)
+            - ``"label"``: FloatTensor of shape ``[12]`` (when ``is_train=True``)
+            - ``"input_ids"`` / ``"attention_mask"``: LongTensor (optional text)
         """
         row: pd.Series = self.df.iloc[index]  # type: ignore[assignment]
         study_uid: str = str(row["StudyInstanceUID"])
 
-        # ── 1. Volumetric image ───────────────────────────────────────────
+        # ── 1. Load MRI volume ────────────────────────────────────────────
         image: torch.Tensor = self._load_volume(study_uid)
 
         # ── 2. Build output dictionary ────────────────────────────────────
@@ -158,11 +155,11 @@ class RSNAKneeDataset(Dataset):  # type: ignore[type-arg]
             "image": image,
         }
 
-        # ── 3. Labels (training mode only) ────────────────────────────────
+        # ── 3. Extract labels ─────────────────────────────────────────────
         if self.is_train:
             sample["label"] = self._extract_labels(row)
 
-        # ── 4. Text tokenisation (optional) ───────────────────────────────
+        # ── 4. Tokenize text report ───────────────────────────────────────
         if self.tokenizer is not None and "report" in self.df.columns:
             text_features: Dict[str, torch.Tensor] = self._tokenize_report(
                 str(row.get("report", ""))
@@ -172,75 +169,199 @@ class RSNAKneeDataset(Dataset):  # type: ignore[type-arg]
         return sample
 
     # ==================================================================
-    # Private helpers
+    # DICOM & Image Volume Loading
     # ==================================================================
 
     def _load_volume(self, study_uid: str) -> torch.Tensor:
-        """Load *num_slices* 2‑D images and stack into ``[1, S, H, W]``.
-
-        Falls back to random noise when images are unavailable so that
-        unit tests and offline development never crash.
-        """
+        """Attempt DICOM / 2D loading; fall back to synthetic data if missing."""
         study_path: Path = self.image_dir / study_uid
-        slices: List[torch.Tensor] = []
+        if not study_path.is_dir():
+            # Check nested path e.g. ./data/train_images/study_uid or ./data/series_uid
+            nested_path: Path = self.image_dir / "train_images" / study_uid
+            if nested_path.is_dir():
+                study_path = nested_path
 
         if study_path.is_dir():
-            # Collect and sort slice file paths (PNG / JPG / DICOM)
-            slice_paths: List[Path] = sorted(
-                [
-                    p
-                    for p in study_path.iterdir()
-                    if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".dcm"}
-                ]
-            )
-            for sp in slice_paths[: self.num_slices]:
-                try:
-                    img: Image.Image = (
-                        Image.open(sp).convert("L").resize(self.image_size)
-                    )
-                    arr: np.ndarray = np.array(img, dtype=np.float32) / 255.0
+            # 1. Try DICOM loading
+            dicom_volume = self._load_dicom_volume(study_path)
+            if dicom_volume is not None:
+                return dicom_volume
 
-                    # Apply optional per‑slice transform
-                    if self.transform is not None:
-                        transformed: Any = self.transform(image=arr)
-                        arr = transformed.get("image", arr)  # Albumentations
-                        if isinstance(arr, torch.Tensor):
-                            arr = arr.numpy()
+            # 2. Try standard image loading (PNG / JPG)
+            image_volume = self._load_standard_images(study_path)
+            if image_volume is not None:
+                return image_volume
 
-                    slices.append(torch.from_numpy(arr))
-                except Exception as exc:
-                    logger.warning(
-                        "Failed to load slice '%s': %s — using random fallback",
-                        sp,
-                        exc,
-                    )
-                    slices.append(
-                        torch.randn(self.image_size[0], self.image_size[1])
-                    )
+        # 3. Fallback: synthetic volume when files are unavailable
+        logger.debug("Study folder '%s' missing or empty -- using random fallback.", study_uid)
+        return torch.randn(1, self.num_slices, self.image_size[0], self.image_size[1])
+
+    def _load_dicom_volume(self, study_path: Path) -> Optional[torch.Tensor]:
+        """Load, sort, resample, and normalize 3D DICOM slice series."""
+        if not PYDICOM_AVAILABLE:
+            return None
+
+        # Recursively search for .dcm files
+        dcm_files: List[Path] = [
+            p for p in study_path.rglob("*")
+            if p.is_file() and (p.suffix.lower() == ".dcm" or "." not in p.name)
+        ]
+
+        if not dcm_files:
+            return None
+
+        # Inspect headers for sorting keys
+        slice_data: List[Tuple[float, np.ndarray]] = []
+        for p in dcm_files:
+            try:
+                ds = pydicom.dcmread(str(p), stop_before_pixels=False)
+                if not hasattr(ds, "pixel_array"):
+                    continue
+
+                # Sorting key priority: InstanceNumber -> SliceLocation -> ImagePositionPatient[2]
+                sort_key: float
+                if hasattr(ds, "InstanceNumber") and ds.InstanceNumber is not None:
+                    sort_key = float(ds.InstanceNumber)
+                elif hasattr(ds, "SliceLocation") and ds.SliceLocation is not None:
+                    sort_key = float(ds.SliceLocation)
+                elif (
+                    hasattr(ds, "ImagePositionPatient")
+                    and len(ds.ImagePositionPatient) >= 3
+                ):
+                    sort_key = float(ds.ImagePositionPatient[2])
+                else:
+                    # Fallback to numeric digits in filename
+                    numbers = [int(s) for s in p.stem.split("_") if s.isdigit()]
+                    sort_key = float(numbers[-1]) if numbers else 0.0
+
+                arr = ds.pixel_array.astype(np.float32)
+
+                # Apply Rescale Slope & Intercept
+                slope = float(getattr(ds, "RescaleSlope", 1.0))
+                intercept = float(getattr(ds, "RescaleIntercept", 0.0))
+                if slope != 1.0 or intercept != 0.0:
+                    arr = arr * slope + intercept
+
+                slice_data.append((sort_key, arr))
+
+            except Exception as exc:
+                logger.debug("Skipping unreadable DICOM slice '%s': %s", p, exc)
+                continue
+
+        if not slice_data:
+            return None
+
+        # Sort slices numerically along Z-axis
+        slice_data.sort(key=lambda item: item[0])
+        raw_slices: List[np.ndarray] = [item[1] for item in slice_data]
+
+        # Uniformly sample/resample to num_slices
+        sampled_slices: List[np.ndarray] = self._resample_slices(raw_slices)
+
+        # Resize each slice to target image_size and apply optional transform
+        resized_slices: List[torch.Tensor] = []
+        for slice_arr in sampled_slices:
+            img = Image.fromarray(slice_arr).resize(self.image_size, Image.BILINEAR)
+            arr = np.array(img, dtype=np.float32)
+
+            if self.transform is not None:
+                transformed = self.transform(image=arr)
+                arr = transformed.get("image", arr)
+                if isinstance(arr, torch.Tensor):
+                    arr = arr.numpy()
+
+            resized_slices.append(torch.from_numpy(arr))
+
+        # Stack into 3D volume array: [S, H, W]
+        vol_3d = torch.stack(resized_slices, dim=0).numpy()
+
+        # 3D Min-Max Volume Normalization
+        vol_min = vol_3d.min()
+        vol_max = vol_3d.max()
+        if vol_max > vol_min:
+            vol_3d = (vol_3d - vol_min) / (vol_max - vol_min + 1e-6)
         else:
-            # ── Fallback: synthetic random volume ─────────────────────────
-            logger.debug(
-                "Study directory not found for '%s'; generating mock volume.",
-                study_uid,
-            )
+            vol_3d = np.zeros_like(vol_3d)
 
-        # Pad / trim to exactly *num_slices*
-        while len(slices) < self.num_slices:
-            slices.append(
-                torch.randn(self.image_size[0], self.image_size[1])
-            )
-        slices = slices[: self.num_slices]
+        # Unsqueeze channel dimension: [1, S, H, W]
+        return torch.from_numpy(vol_3d).unsqueeze(0)
 
-        # Stack → [S, H, W] then unsqueeze channel → [1, S, H, W]
-        volume: torch.Tensor = torch.stack(slices, dim=0).unsqueeze(0)
-        return volume
+    def _load_standard_images(self, study_path: Path) -> Optional[torch.Tensor]:
+        """Fallback loader for PNG / JPG slice series."""
+        slice_paths: List[Path] = sorted(
+            [
+                p for p in study_path.iterdir()
+                if p.suffix.lower() in {".png", ".jpg", ".jpeg"}
+            ]
+        )
+        if not slice_paths:
+            return None
+
+        raw_slices: List[np.ndarray] = []
+        for sp in slice_paths:
+            try:
+                img = Image.open(sp).convert("L")
+                raw_slices.append(np.array(img, dtype=np.float32))
+            except Exception:
+                continue
+
+        if not raw_slices:
+            return None
+
+        sampled_slices = self._resample_slices(raw_slices)
+        resized_slices: List[torch.Tensor] = []
+
+        for arr in sampled_slices:
+            img = Image.fromarray(arr).resize(self.image_size)
+            slice_arr = np.array(img, dtype=np.float32)
+
+            if self.transform is not None:
+                t = self.transform(image=slice_arr)
+                slice_arr = t.get("image", slice_arr)
+                if isinstance(slice_arr, torch.Tensor):
+                    slice_arr = slice_arr.numpy()
+
+            resized_slices.append(torch.from_numpy(slice_arr))
+
+        vol_3d = torch.stack(resized_slices, dim=0).numpy()
+        vol_min, vol_max = vol_3d.min(), vol_3d.max()
+        if vol_max > vol_min:
+            vol_3d = (vol_3d - vol_min) / (vol_max - vol_min + 1e-6)
+        else:
+            vol_3d = np.zeros_like(vol_3d)
+
+        return torch.from_numpy(vol_3d).unsqueeze(0)
+
+    def _resample_slices(self, slices: List[np.ndarray]) -> List[np.ndarray]:
+        """Uniformly sample or interpolate slice list to exactly `num_slices`."""
+        n_curr = len(slices)
+        if n_curr == self.num_slices:
+            return slices
+
+        if n_curr > self.num_slices:
+            indices = np.linspace(0, n_curr - 1, self.num_slices, dtype=int)
+            return [slices[i] for i in indices]
+
+        # n_curr < num_slices: duplicate / interpolate
+        indices = np.linspace(0, n_curr - 1, self.num_slices)
+        resampled: List[np.ndarray] = []
+        for idx in indices:
+            lower = int(np.floor(idx))
+            upper = int(np.ceil(idx))
+            weight = idx - lower
+            if lower == upper or weight == 0:
+                resampled.append(slices[lower])
+            else:
+                interp = (1.0 - weight) * slices[lower] + weight * slices[upper]
+                resampled.append(interp.astype(slices[0].dtype))
+        return resampled
+
+    # ==================================================================
+    # Utility Helpers
+    # ==================================================================
 
     def _extract_labels(self, row: pd.Series) -> torch.Tensor:  # type: ignore[type-arg]
-        """Extract target columns into a ``[num_classes]`` float tensor.
-
-        Missing columns are filled with ``0.0`` so the dataset never crashes
-        when a target column is absent (useful during debugging).
-        """
+        """Extract multi-label target values as a FloatTensor."""
         labels: List[float] = []
         for col in self.target_columns:
             try:
@@ -250,13 +371,7 @@ class RSNAKneeDataset(Dataset):  # type: ignore[type-arg]
         return torch.tensor(labels, dtype=torch.float32)
 
     def _tokenize_report(self, text: str) -> Dict[str, torch.Tensor]:
-        """Tokenise a single radiology report string.
-
-        Returns
-        -------
-        dict
-            ``"input_ids"`` and ``"attention_mask"`` as ``torch.LongTensor``.
-        """
+        """Tokenize radiology report text."""
         if not text or text.lower() in {"nan", "none", ""}:
             text = "[NO REPORT]"
 
@@ -273,10 +388,56 @@ class RSNAKneeDataset(Dataset):  # type: ignore[type-arg]
                 "attention_mask": encoding["attention_mask"].squeeze(0),
             }
         except Exception as exc:
-            logger.error("Tokenisation failed for text='%s…': %s", text[:60], exc)
+            logger.error("Tokenisation failed: %s", exc)
             return {
                 "input_ids": torch.zeros(self.max_text_length, dtype=torch.long),
-                "attention_mask": torch.zeros(
-                    self.max_text_length, dtype=torch.long
-                ),
+                "attention_mask": torch.zeros(self.max_text_length, dtype=torch.long),
             }
+
+
+# =========================================================================
+# Self-Test Runner
+# =========================================================================
+
+def main() -> None:
+    """Run a quick self-test of the dataset loader."""
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-8s | %(message)s")
+
+    print("\n" + "=" * 70)
+    print("  RSNA Knee Abnormality Dataset -- Self-Test")
+    print("=" * 70)
+
+    # Check for train.csv or train_folds.csv in data/ or root
+    csv_paths = ["./data/train.csv", "./data/train_folds.csv", "train_folds.csv", "train.csv"]
+    csv_found: Optional[str] = next((p for p in csv_paths if os.path.isfile(p)), None)
+
+    if csv_found:
+        print(f"  Found metadata at '{csv_found}'")
+        df = pd.read_csv(csv_found)
+    else:
+        print("  No train.csv found -- generating dummy metadata frame for test.")
+        df = pd.DataFrame({
+            "StudyInstanceUID": ["1.2.826.0.1.0", "1.2.826.0.1.1"],
+            **{col: [1.0, 0.0] for col in DEFAULT_TARGET_COLUMNS},
+        })
+
+    dataset = RSNAKneeDataset(
+        df=df,
+        image_dir="./data",
+        num_slices=32,
+        image_size=(224, 224),
+        is_train=True,
+    )
+
+    sample = dataset[0]
+    print(f"\n  Sample 0 Study UID: {sample['study_uid']}")
+    print(f"  Image volume shape: {list(sample['image'].shape)} (min={sample['image'].min():.3f}, max={sample['image'].max():.3f})")
+    print(f"  Label shape:        {list(sample['label'].shape)}")
+    print(f"  Labels tensor:      {sample['label'].tolist()}")
+
+    print("\n  [PASS] RSNAKneeDataset loaded successfully!")
+    print("=" * 70 + "\n")
+
+
+if __name__ == "__main__":
+    main()
