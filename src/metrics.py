@@ -85,8 +85,14 @@ def compute_macro_auc(
             col_true: np.ndarray = y_true[:, idx]
             col_pred: np.ndarray = y_pred[:, idx]
 
+            # Binarize soft pseudo-labels for AUC calculation.
+            # Training loss uses the raw continuous values; this
+            # threshold is ONLY for sklearn's roc_auc_score which
+            # requires binary {0, 1} ground truth.
+            col_true_binary: np.ndarray = (col_true >= 0.5).astype(int)
+
             # Guard: AUC is undefined when only one class is present
-            unique_labels: np.ndarray = np.unique(col_true)
+            unique_labels: np.ndarray = np.unique(col_true_binary)
             if len(unique_labels) < 2:
                 logger.warning(
                     "Target '%s' has only one class present in y_true "
@@ -97,7 +103,7 @@ def compute_macro_auc(
                 per_class[col_name] = 0.5
                 continue
 
-            auc: float = float(roc_auc_score(col_true, col_pred))
+            auc: float = float(roc_auc_score(col_true_binary, col_pred))
             per_class[col_name] = auc
 
         except Exception as exc:
