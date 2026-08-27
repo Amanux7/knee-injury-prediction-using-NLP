@@ -53,4 +53,3 @@ training:
   weight_decay: 1.0e-2
   epochs: 10
   seed: 42
-
