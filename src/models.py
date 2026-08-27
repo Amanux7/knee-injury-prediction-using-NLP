@@ -342,6 +342,20 @@ class RSNADINOv2Model(nn.Module):
         self.num_classes: int = num_classes
         self.num_slices: int = num_slices
 
+        # DINOv2 uses the standard ImageNet normalization during pretraining.
+        # Keep these as non-persistent buffers so old checkpoints remain fully
+        # compatible while training and inference share identical preprocessing.
+        self.register_buffer(
+            "pixel_mean",
+            torch.tensor([0.485, 0.456, 0.406]).view(1, 1, 3, 1, 1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "pixel_std",
+            torch.tensor([0.229, 0.224, 0.225]).view(1, 1, 3, 1, 1),
+            persistent=False,
+        )
+
         # -- Load DINOv2 backbone ------------------------------------------
         self.backbone: nn.Module
         self.embed_dim: int
@@ -419,6 +433,10 @@ class RSNADINOv2Model(nn.Module):
             x = x.unsqueeze(2).repeat(1, 1, 3, 1, 1)
         elif x.ndim == 5 and x.shape[2] == 1:
             x = x.repeat(1, 1, 3, 1, 1)
+
+        # Dataset volumes are min-max scaled to [0, 1]. Match the DINOv2
+        # pretraining distribution before extracting slice features.
+        x = (x - self.pixel_mean) / self.pixel_std
 
         B, S, C, H, W = x.shape
 
@@ -507,3 +525,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
