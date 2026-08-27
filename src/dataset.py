@@ -15,8 +15,9 @@ Key Features & Pipeline
    normalisation ``(vol - min) / (max - min + 1e-6)``.
 4. **Rescale Handling**: Respects DICOM ``RescaleSlope`` and ``RescaleIntercept``
    header tags.
-5. **Fallback Safety**: Gracefully falls back to synthetic ``torch.randn``
-   tensors if local image files or study folders are absent during testing.
+5. **Missing-data Safety**: Raises immediately when a study cannot be loaded in
+   production. Synthetic tensors are available only when explicitly enabled
+   for smoke tests.
 6. **Multimodal Text**: Supports HuggingFace report tokenisation when a report
    column is present.
 """
@@ -74,8 +75,8 @@ class RSNAKneeDataset(Dataset):  # type: ignore[type-arg]
     df : pd.DataFrame
         Metadata frame containing ``"StudyInstanceUID"`` and target columns.
     image_dir : Union[str, Path]
-        Root directory containing study folders (e.g., ``./data/train_images``
-        or ``./data/``).
+        Root directory containing study folders (e.g., ``./data/train_series``
+        or the competition data root).
     target_columns : List[str]
         List of target column names (12 classes).
     image_size : tuple[int, int]
@@ -90,6 +91,13 @@ class RSNAKneeDataset(Dataset):  # type: ignore[type-arg]
         If ``True``, extracts multi-label target tensors.
     transform : Optional[Callable]
         Per-slice spatial/intensity image transformation.
+    allow_missing_images : bool
+        If ``True``, return a random tensor when a study cannot be loaded.
+        This is intended only for synthetic smoke tests.
+    series_df : Optional[pd.DataFrame]
+        Competition series metadata. When supplied, one coherent MRI series is
+        selected per study (preferring fluid-sensitive sagittal acquisitions)
+        instead of mixing slices from different anatomical planes.
     """
 
     def __init__(
@@ -103,6 +111,8 @@ class RSNAKneeDataset(Dataset):  # type: ignore[type-arg]
         max_text_length: int = 256,
         is_train: bool = True,
         transform: Optional[Callable[..., Any]] = None,
+        allow_missing_images: bool = False,
+        series_df: Optional[pd.DataFrame] = None,
     ) -> None:
         super().__init__()
 
@@ -118,14 +128,47 @@ class RSNAKneeDataset(Dataset):  # type: ignore[type-arg]
         self.max_text_length: int = max_text_length
         self.is_train: bool = is_train
         self.transform: Optional[Callable[..., Any]] = transform
+        self.allow_missing_images: bool = allow_missing_images
+        self.series_map: Dict[str, List[Tuple[str, int]]] = {}
+        if series_df is not None:
+            required = {"StudyInstanceUID", "SeriesInstanceUID"}
+            missing_columns = required.difference(series_df.columns)
+            if missing_columns:
+                raise ValueError(
+                    "series_df is missing required columns: "
+                    f"{sorted(missing_columns)}"
+                )
+            for _, series_row in series_df.iterrows():
+                study_uid = str(series_row["StudyInstanceUID"])
+                series_uid = str(series_row["SeriesInstanceUID"])
+                plane = str(series_row.get("Anatomical_Plane", "")).lower()
+                fluid = int(series_row.get("Fluid_Sensitive", 0) == 1)
+                fat_suppressed = int(series_row.get("Fat_Suppression", 0) == 1)
+                plane_priority = {"sagittal": 3, "coronal": 2, "axial": 1}.get(
+                    plane, 0,
+                )
+                priority = (
+                    100 * int(plane == "sagittal" and fluid == 1)
+                    + 10 * plane_priority
+                    + 2 * fluid
+                    + fat_suppressed
+                )
+                self.series_map.setdefault(study_uid, []).append(
+                    (series_uid, priority),
+                )
+            for candidates in self.series_map.values():
+                candidates.sort(key=lambda item: (-item[1], item[0]))
 
         logger.info(
             "RSNAKneeDataset initialized | samples=%d | is_train=%s | "
-            "num_slices=%d | image_size=%s | pydicom=%s",
+            "num_slices=%d | image_size=%s | image_dir=%s | "
+            "allow_missing_images=%s | pydicom=%s",
             len(self.df),
             self.is_train,
             self.num_slices,
             self.image_size,
+            self.image_dir,
+            self.allow_missing_images,
             PYDICOM_AVAILABLE,
         )
 
@@ -173,15 +216,10 @@ class RSNAKneeDataset(Dataset):  # type: ignore[type-arg]
     # ==================================================================
 
     def _load_volume(self, study_uid: str) -> torch.Tensor:
-        """Attempt DICOM / 2D loading; fall back to synthetic data if missing."""
-        study_path: Path = self.image_dir / study_uid
-        if not study_path.is_dir():
-            # Check nested path e.g. ./data/train_images/study_uid or ./data/series_uid
-            nested_path: Path = self.image_dir / "train_images" / study_uid
-            if nested_path.is_dir():
-                study_path = nested_path
+        """Load one MRI series, with synthetic fallback only when enabled."""
+        study_path = self._resolve_series_path(study_uid)
 
-        if study_path.is_dir():
+        if study_path is not None:
             # 1. Try DICOM loading
             dicom_volume = self._load_dicom_volume(study_path)
             if dicom_volume is not None:
@@ -192,9 +230,65 @@ class RSNAKneeDataset(Dataset):  # type: ignore[type-arg]
             if image_volume is not None:
                 return image_volume
 
-        # 3. Fallback: synthetic volume when files are unavailable
-        logger.debug("Study folder '%s' missing or empty -- using random fallback.", study_uid)
-        return torch.randn(1, self.num_slices, self.image_size[0], self.image_size[1])
+        if self.allow_missing_images:
+            logger.debug(
+                "Study '%s' missing or unreadable -- using smoke-test random fallback.",
+                study_uid,
+            )
+            return torch.randn(
+                1, self.num_slices, self.image_size[0], self.image_size[1],
+            )
+
+        raise FileNotFoundError(
+            "No readable DICOM/PNG/JPG scan found for study "
+            f"'{study_uid}' below '{self.image_dir}'. "
+            "Pass the real Kaggle image directory via --image-dir; random "
+            "fallback is intentionally disabled for training/inference."
+        )
+
+    def _resolve_series_path(self, study_uid: str) -> Optional[Path]:
+        """Resolve one coherent series directory for a competition study."""
+        study_roots = [
+            self.image_dir / study_uid,
+            self.image_dir / "train_series" / study_uid,
+            self.image_dir / "test_series" / study_uid,
+            self.image_dir / "train_images" / study_uid,
+        ]
+
+        for study_root in study_roots:
+            if not study_root.is_dir():
+                continue
+
+            metadata_candidates = self.series_map.get(study_uid, [])
+            existing_candidates: List[Tuple[int, int, Path]] = []
+            for series_uid, priority in metadata_candidates:
+                series_path = study_root / series_uid
+                if series_path.is_dir():
+                    slice_count = sum(1 for p in series_path.iterdir() if p.is_file())
+                    existing_candidates.append((priority, slice_count, series_path))
+
+            if existing_candidates:
+                return max(existing_candidates, key=lambda item: (item[0], item[1]))[2]
+
+            # Backward-compatible single-series studies may store DICOMs
+            # directly under the study folder.
+            if any(path.is_file() for path in study_root.iterdir()):
+                return study_root
+
+            # Without metadata, choose the largest series rather than
+            # recursively mixing sagittal/coronal/axial slices.
+            series_dirs = [path for path in study_root.iterdir() if path.is_dir()]
+            if series_dirs:
+                logger.warning(
+                    "No series metadata for study '%s'; selecting its largest series.",
+                    study_uid,
+                )
+                return max(
+                    series_dirs,
+                    key=lambda path: sum(1 for item in path.iterdir() if item.is_file()),
+                )
+
+        return None
 
     def _load_dicom_volume(self, study_path: Path) -> Optional[torch.Tensor]:
         """Load, sort, resample, and normalize 3D DICOM slice series."""
@@ -427,6 +521,7 @@ def main() -> None:
         num_slices=32,
         image_size=(224, 224),
         is_train=True,
+        allow_missing_images=(csv_found is None),
     )
 
     sample = dataset[0]
@@ -441,3 +536,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
