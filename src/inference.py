@@ -276,6 +276,7 @@ def run_ensemble_inference(
     num_workers: int,
     device: torch.device,
     use_amp: bool,
+    series_df: Optional[pd.DataFrame] = None,
 ) -> Tuple[List[str], np.ndarray]:
     """Run inference with multiple checkpoints and average predictions.
 
@@ -303,6 +304,7 @@ def run_ensemble_inference(
         image_size=image_size,
         num_slices=num_slices,
         is_train=False,  # test mode: no labels
+        series_df=series_df,
     )
     test_loader = DataLoader(
         test_ds,
@@ -435,9 +437,11 @@ def parse_args() -> argparse.Namespace:
         epilog=(
             "Examples:\n"
             "  python src/inference.py --weights best_model.pth "
-            "--data-dir data/test_images --csv data/test.csv\n"
+            "--data-dir data/test_series --csv data/test.csv "
+            "--series-csv data/test_series.csv\n"
             "  python src/inference.py --weights fold0.pth fold1.pth fold2.pth "
-            "--data-dir data/test_images --csv data/test.csv\n"
+            "--data-dir data/test_series --csv data/test.csv "
+            "--series-csv data/test_series.csv\n"
         ),
     )
 
@@ -459,6 +463,11 @@ def parse_args() -> argparse.Namespace:
         "--csv", "-c",
         required=True,
         help="Path to test.csv with StudyInstanceUID column.",
+    )
+    parser.add_argument(
+        "--series-csv",
+        required=True,
+        help="Path to test_series.csv used to select a coherent MRI series.",
     )
     parser.add_argument(
         "--output", "-o",
@@ -525,6 +534,12 @@ def main() -> None:
     if not os.path.isfile(args.csv):
         logger.error("Test CSV not found: %s", args.csv)
         sys.exit(1)
+    if not os.path.isfile(args.series_csv):
+        logger.error("Test series CSV not found: %s", args.series_csv)
+        sys.exit(1)
+    if not os.path.isdir(args.data_dir):
+        logger.error("Test image directory not found: %s", args.data_dir)
+        sys.exit(1)
 
     # Device & AMP
     device = _get_device()
@@ -534,7 +549,9 @@ def main() -> None:
     # Load test metadata
     logger.info("Loading test CSV: %s", args.csv)
     test_df = pd.read_csv(args.csv)
+    series_df = pd.read_csv(args.series_csv)
     logger.info("Test set: %d studies", len(test_df))
+    logger.info("Test series metadata: %d rows", len(series_df))
 
     print("\n" + "=" * 72)
     print("  RSNA KNEE ABNORMALITY DETECTION -- INFERENCE")
@@ -560,6 +577,7 @@ def main() -> None:
         num_workers=args.num_workers,
         device=device,
         use_amp=use_amp,
+        series_df=series_df,
     )
 
     # Write submission
@@ -573,3 +591,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
