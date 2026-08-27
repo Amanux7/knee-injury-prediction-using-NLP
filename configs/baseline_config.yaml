@@ -30,6 +30,9 @@ competition:
 # Data Settings
 # ──────────────────────────────────────────────────────────────────────────────
 data:
+  # Override with --image-dir on Kaggle (the input mount is environment-specific).
+  image_dir: "train_series"
+  series_csv: "train_series.csv"
   image_size: [224, 224]
   num_slices: 32
   batch_size: 2  # Changed from 8 to 2 to prevent GPU OOM
@@ -40,9 +43,14 @@ data:
 #
 model:
   backbone: "dinov2_vitb14"
+  # Override with --weights-dir when using an unpacked offline Kaggle dataset.
+  weights_dir: null
 
 training:
   learning_rate: 3.0e-4
+  # Protect pretrained DINOv2 features; the new head keeps learning_rate above.
+  backbone_learning_rate: 1.0e-5
   weight_decay: 1.0e-2
   epochs: 10
   seed: 42
+
