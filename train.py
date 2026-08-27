@@ -269,7 +269,7 @@ def validate(
         running_loss += loss.item()
         num_batches += 1
 
-        probs: np.ndarray = torch.sigmoid(logits.detach()).cpu().numpy()
+        probs: np.ndarray = torch.sigmoid(logits.detach().float()).cpu().numpy()
         all_preds.append(probs)
         all_labels.append(labels.detach().cpu().numpy())
 
@@ -282,6 +282,18 @@ def validate(
     avg_loss: float = running_loss / max(num_batches, 1)
     y_pred: np.ndarray = np.concatenate(all_preds, axis=0)
     y_true: np.ndarray = np.concatenate(all_labels, axis=0)
+
+    pred_std = np.std(y_pred, axis=0)
+    logger.info(
+        "Validation prediction spread | mean std=%.6f | min std=%.6f | "
+        "max std=%.6f",
+        float(pred_std.mean()), float(pred_std.min()), float(pred_std.max()),
+    )
+    if float(pred_std.max()) < 1e-4:
+        logger.warning(
+            "Predictions are effectively constant across validation studies. "
+            "Verify image loading and optimizer settings before continuing."
+        )
 
     macro_auc, per_class = compute_macro_auc(y_true, y_pred, target_columns)
     return avg_loss, macro_auc, per_class
@@ -317,6 +329,9 @@ def run_training(
     output_dir: Path,
     backbone_override: Optional[str] = None,
     smoke_test: bool = False,
+    image_dir: str = "train_series",
+    weights_dir: Optional[str] = None,
+    series_df: Optional[pd.DataFrame] = None,
 ) -> float:
     """Execute the full train/validate loop for one fold."""
     # ── Dynamic Backbone Resolution ──────────────────────────────────────
@@ -334,6 +349,7 @@ def run_training(
     batch_size: int = 4 if smoke_test else cfg["data"]["batch_size"]
     num_workers: int = 0 if smoke_test else cfg["data"]["num_workers"]
     lr: float = cfg["training"]["learning_rate"]
+    backbone_lr: float = cfg["training"].get("backbone_learning_rate", lr)
     wd: float = cfg["training"]["weight_decay"]
     epochs: int = 1 if smoke_test else cfg["training"]["epochs"]
     seed: int = cfg["training"]["seed"]
@@ -348,22 +364,69 @@ def run_training(
     logger.info("Fold %d | train=%d  val=%d", fold, len(train_df), len(val_df))
 
     # ── Datasets & Loaders ────────────────────────────────────────────────
-    image_dir: str = "train_images"
+    image_root = Path(image_dir).expanduser()
+    if not smoke_test:
+        if not image_root.is_dir():
+            raise FileNotFoundError(
+                f"Training image directory does not exist: '{image_root}'. "
+                "On Kaggle, pass the mounted competition directory with "
+                "--image-dir."
+            )
+
+        all_uids = df["StudyInstanceUID"].astype(str).unique().tolist()
+        if series_df is None:
+            raise ValueError(
+                "Real competition training requires train_series.csv. Pass it "
+                "with --series-csv so anatomical planes are not mixed."
+            )
+        series_studies = set(series_df["StudyInstanceUID"].astype(str))
+        missing_metadata = [uid for uid in all_uids if uid not in series_studies]
+        if missing_metadata:
+            examples = ", ".join(missing_metadata[:5])
+            raise ValueError(
+                f"Series metadata is missing {len(missing_metadata)} studies. "
+                f"Examples: {examples}."
+            )
+
+        missing_uids = []
+        for uid in all_uids:
+            candidate_roots = (
+                image_root / uid,
+                image_root / "train_series" / uid,
+            )
+            if not any(path.is_dir() for path in candidate_roots):
+                missing_uids.append(uid)
+        if missing_uids:
+            examples = ", ".join(missing_uids[:5])
+            raise FileNotFoundError(
+                f"Image preflight failed: {len(missing_uids)}/{len(all_uids)} "
+                f"study folders are missing below '{image_root}'. "
+                f"Examples: {examples}. Check --image-dir and UID mapping."
+            )
+        logger.info(
+            "Image preflight passed: %d/%d study folders found below '%s'.",
+            len(all_uids), len(all_uids), image_root,
+        )
+
     train_ds = RSNAKneeDataset(
         df=train_df,
-        image_dir=image_dir,
+        image_dir=image_root,
         target_columns=target_columns,
         image_size=image_size,
         num_slices=num_slices,
         is_train=True,
+        allow_missing_images=smoke_test,
+        series_df=series_df,
     )
     val_ds = RSNAKneeDataset(
         df=val_df,
-        image_dir=image_dir,
+        image_dir=image_root,
         target_columns=target_columns,
         image_size=image_size,
         num_slices=num_slices,
         is_train=True,
+        allow_missing_images=smoke_test,
+        series_df=series_df,
     )
 
     train_loader = DataLoader(
@@ -389,15 +452,41 @@ def run_training(
         num_classes=num_classes,
         in_chans=num_slices,
         pretrained=(not smoke_test),
+        weights_dir=weights_dir,
     )
     model = model.to(device)
 
     criterion: nn.Module = nn.BCEWithLogitsLoss()
-    optimizer: torch.optim.Optimizer = torch.optim.AdamW(
-        model.parameters(), lr=lr, weight_decay=wd,
-    )
+    if hasattr(model, "backbone"):
+        backbone_params = [
+            param for param in model.backbone.parameters() if param.requires_grad
+        ]
+    else:
+        backbone_params = []
+
+    if backbone_params:
+        backbone_param_ids = {id(param) for param in backbone_params}
+        task_params = [
+            param for param in model.parameters()
+            if param.requires_grad and id(param) not in backbone_param_ids
+        ]
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": task_params, "lr": lr},
+                {"params": backbone_params, "lr": backbone_lr},
+            ],
+            weight_decay=wd,
+        )
+        logger.info(
+            "Differential learning rates | head+aggregator=%.2e | backbone=%.2e",
+            lr, backbone_lr,
+        )
+    else:
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=lr, weight_decay=wd,
+        )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=epochs, eta_min=lr * 0.01,
+        optimizer, T_max=epochs, eta_min=min(lr, backbone_lr) * 0.01,
     )
 
     scaler: Optional[torch.amp.GradScaler] = (  # type: ignore[type-arg]
@@ -432,7 +521,7 @@ def run_training(
 
         scheduler.step()
         elapsed: float = time.time() - t0
-        current_lr: float = optimizer.param_groups[0]["lr"]
+        current_lr: float = max(group["lr"] for group in optimizer.param_groups)
 
         print(
             f"  Epoch {epoch:>2d}/{epochs} | "
@@ -510,6 +599,33 @@ def parse_args() -> argparse.Namespace:
         help="Directory to save model checkpoints (default: %(default)s).",
     )
     parser.add_argument(
+        "--image-dir",
+        type=str,
+        default=None,
+        help=(
+            "Root containing StudyInstanceUID folders. Overrides "
+            "data.image_dir in the config."
+        ),
+    )
+    parser.add_argument(
+        "--weights-dir",
+        type=str,
+        default=None,
+        help=(
+            "Directory containing unpacked DINOv2 weights. Overrides "
+            "model.weights_dir in the config."
+        ),
+    )
+    parser.add_argument(
+        "--series-csv",
+        type=str,
+        default=None,
+        help=(
+            "Path to train_series.csv. Overrides data.series_csv in the "
+            "config and is required for real competition training."
+        ),
+    )
+    parser.add_argument(
         "--smoke-test",
         action="store_true",
         help="Run 1 mini-epoch on synthetic data to verify the pipeline.",
@@ -560,6 +676,30 @@ def main() -> None:
 
     # -- Run training ------------------------------------------------------
     output_dir: Path = Path(args.output_dir)
+    image_dir: str = (
+        args.image_dir
+        or cfg.get("data", {}).get("image_dir")
+        or "train_series"
+    )
+    weights_dir: Optional[str] = (
+        args.weights_dir
+        or cfg.get("model", {}).get("weights_dir")
+    )
+    series_df: Optional[pd.DataFrame] = None
+    if not args.smoke_test:
+        series_csv = (
+            args.series_csv
+            or cfg.get("data", {}).get("series_csv")
+            or "train_series.csv"
+        )
+        series_csv_path = Path(series_csv)
+        if not series_csv_path.is_file():
+            raise FileNotFoundError(
+                f"Series metadata CSV not found: '{series_csv_path}'. Pass the "
+                "Kaggle train_series.csv path with --series-csv."
+            )
+        series_df = pd.read_csv(series_csv_path)
+        logger.info("Series metadata: %d rows from '%s'.", len(series_df), series_csv_path)
     best_auc: float = run_training(
         cfg=cfg,
         fold=fold,
@@ -567,6 +707,9 @@ def main() -> None:
         output_dir=output_dir,
         backbone_override=args.backbone,
         smoke_test=args.smoke_test,
+        image_dir=image_dir,
+        weights_dir=weights_dir,
+        series_df=series_df,
     )
 
     logger.info("Training finished. Best validation Macro AUC = %.4f", best_auc)
@@ -574,3 +717,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
