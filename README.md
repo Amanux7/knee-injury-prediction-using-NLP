@@ -111,8 +111,15 @@ python train.py --smoke-test
 Train Fold 0 using the configuration in `configs/baseline_config.yaml`:
 
 ```bash
-python train.py --fold 0 --config configs/baseline_config.yaml
+python train.py --fold 0 --config configs/baseline_config.yaml \
+  --image-dir /path/to/train_series \
+  --series-csv /path/to/train_series.csv \
+  --weights-dir /path/to/unpacked_dinov2_cache
 ```
+
+Real training and inference fail immediately when a study cannot be loaded.
+Synthetic random-image fallback is restricted to ``--smoke-test`` so an
+incorrect data mount cannot silently produce chance-level training.
 
 ---
 
